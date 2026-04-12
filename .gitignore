@@ -1,0 +1,6 @@
+node_modules/
+.env
+cookies.json
+downloaded.json
+*.log
+logs/
