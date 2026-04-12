@@ -1,0 +1,1 @@
+(crontab -l 2>/dev/null; echo "0 11 * * * cd /home/flexget99/torrentleech-hnr && /home/flexget99/.nvm/versions/node/v24.14.1/bin/node index.js >> /home/flexget99/torrentleech-hnr/cron.log 2>&1") | crontab -
