@@ -18,7 +18,9 @@ const TL_HNR_URL    = `${TL_BASE}/profile/${process.env.USERNAME}/hnr`;
 const QT_BASE       = process.env.QT_URL;
 const COOKIES_FILE  = path.join(__dirname, 'cookies.json');
 const STATE_FILE    = path.join(__dirname, 'downloaded.json');
-const PRUNE_DAYS    = 9;
+const PRUNE_DAYS             = 9;
+const PRUNE_SECONDS          = PRUNE_DAYS * 24 * 3600;
+const SEED_TIME_LIMIT_MINS   = PRUNE_DAYS * 24 * 60;
 const USER_AGENT    = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 // --- Cookie jar (loaded from disk if available) ---
@@ -199,12 +201,16 @@ async function loginQBittorrent() {
   return sid;
 }
 
-async function getQBittorrentHashes(sidCookie) {
+async function getQBittorrentTorrents(sidCookie) {
   const res = await axios.get(`${QT_BASE}/api/v2/torrents/info`, {
     params: { category: process.env.QT_CATEGORY },
     headers: { Cookie: sidCookie },
   });
-  return new Set(res.data.map(t => t.hash));
+  return res.data;
+}
+
+async function getQBittorrentHashes(sidCookie) {
+  return new Set((await getQBittorrentTorrents(sidCookie)).map(t => t.hash));
 }
 
 async function addTorrentToQBittorrent(tmpFile, filename, sidCookie) {
@@ -215,6 +221,7 @@ async function addTorrentToQBittorrent(tmpFile, filename, sidCookie) {
   });
   form.append('category', process.env.QT_CATEGORY);
   form.append('forceStart', 'true');
+  form.append('seedingTimeLimit', String(SEED_TIME_LIMIT_MINS));
 
   const before = await getQBittorrentHashes(sidCookie);
 
@@ -249,6 +256,28 @@ async function deleteTorrentFromQBittorrent(hash, sidCookie) {
   });
 }
 
+// --- Completion pruner ---
+async function pruneCompletedTorrents(sidCookie, state) {
+  const torrents = await getQBittorrentTorrents(sidCookie);
+  const byHash   = new Map(torrents.map(t => [t.hash, t]));
+  let pruned     = 0;
+
+  for (const [torrentId, info] of Object.entries(state)) {
+    if (!info.qtHash) continue;
+    const torrent = byHash.get(info.qtHash);
+    if (!torrent) continue;
+    if (torrent.seeding_time >= PRUNE_SECONDS) {
+      await deleteTorrentFromQBittorrent(info.qtHash, sidCookie);
+      log(`Pruned: ${info.torrentName} (seeded ${Math.round(torrent.seeding_time / 3600)}h)`);
+      delete state[torrentId];
+      pruned++;
+    }
+  }
+
+  if (pruned > 0) saveState(state);
+  log(`Pruned ${pruned} completed torrent(s)`);
+}
+
 // --- Utilities ---
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
@@ -262,28 +291,31 @@ async function main() {
 
   await ensureLoggedIn();
 
-  const state   = loadState();
-  const entries = await getAllHnrEntries();
-  log(`Total HNR entries found: ${entries.length}`);
-
-  // Prune: delete from qBittorrent (with data) + remove from state when seeding done
-  const toPrune = entries.filter(
-    ({ torrentId, seedingDays }) => state[torrentId] && seedingDays > PRUNE_DAYS
-  );
-
-  // Identify torrents not yet downloaded and not past prune threshold
-  const toDownload = entries.filter(
-    ({ torrentId, seedingDays }) => !state[torrentId] && seedingDays <= PRUNE_DAYS
-  );
+  const state     = loadState();
+  const sidCookie = await loginQBittorrent();
 
   if (dryRun) {
-    if (toPrune.length > 0) {
-      log(`\nTorrents that would be deleted from qBittorrent (${toPrune.length}):`);
-      for (const { torrentId, seedingText } of toPrune) {
-        const { torrentName, qtHash } = state[torrentId];
-        log(`  [${torrentId}] ${torrentName}  (seeding: ${seedingText})${qtHash ? '' : '  [no hash — skipping qBittorrent delete]'}`);
+    const torrents   = await getQBittorrentTorrents(sidCookie);
+    const byHash     = new Map(torrents.map(t => [t.hash, t]));
+    const wouldPrune = Object.entries(state).filter(([, info]) => {
+      if (!info.qtHash) return false;
+      const t = byHash.get(info.qtHash);
+      return t && t.seeding_time >= PRUNE_SECONDS;
+    });
+
+    if (wouldPrune.length > 0) {
+      log(`\nTorrents that would be deleted from qBittorrent (${wouldPrune.length}):`);
+      for (const [torrentId, info] of wouldPrune) {
+        const t = byHash.get(info.qtHash);
+        log(`  [${torrentId}] ${info.torrentName}  (seeded: ${Math.round(t.seeding_time / 3600)}h)`);
       }
     }
+
+    const entries    = await getAllHnrEntries();
+    const toDownload = entries.filter(
+      ({ torrentId, seedingDays }) => !state[torrentId] && seedingDays <= PRUNE_DAYS
+    );
+
     if (toDownload.length > 0) {
       log(`\nFiles that would be uploaded to qBittorrent (${toDownload.length}):`);
       for (const { torrentId, seedingText } of toDownload) {
@@ -293,29 +325,20 @@ async function main() {
         await sleep(500);
       }
     }
-    if (toPrune.length === 0 && toDownload.length === 0) log('Nothing to do.');
+
+    if (wouldPrune.length === 0 && toDownload.length === 0) log('Nothing to do.');
     log('\nDry run complete — nothing written.');
     return;
   }
 
-  // Login to qBittorrent once if either deletions or uploads are needed
-  let sidCookie;
-  if (toPrune.length > 0 || toDownload.length > 0) {
-    sidCookie = await loginQBittorrent();
-  }
+  await pruneCompletedTorrents(sidCookie, state);
 
-  // Delete pruned torrents from qBittorrent
-  for (const { torrentId, seedingText } of toPrune) {
-    const { torrentName, qtHash } = state[torrentId];
-    if (qtHash) {
-      await deleteTorrentFromQBittorrent(qtHash, sidCookie);
-      log(`Deleted from qBittorrent: ${torrentName} (seeding: ${seedingText})`);
-    } else {
-      log(`Pruning ${torrentId} — no stored hash, skipping qBittorrent delete`);
-    }
-    delete state[torrentId];
-  }
-  if (toPrune.length > 0) saveState(state);
+  const entries    = await getAllHnrEntries();
+  log(`Total HNR entries found: ${entries.length}`);
+
+  const toDownload = entries.filter(
+    ({ torrentId, seedingDays }) => !state[torrentId] && seedingDays <= PRUNE_DAYS
+  );
 
   log(`New torrents to download: ${toDownload.length}`);
   if (toDownload.length === 0) {
