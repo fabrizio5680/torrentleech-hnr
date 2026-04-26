@@ -226,9 +226,9 @@ async function loginQBittorrent() {
   return sid;
 }
 
-async function getQBittorrentTorrents(sidCookie) {
+async function getQBittorrentTorrents(sidCookie, filter) {
   const res = await axios.get(`${QT_BASE}/api/v2/torrents/info`, {
-    params: { category: QT_CATEGORY },
+    params: { category: QT_CATEGORY, ...(filter && { filter }) },
     headers: qtHeaders(sidCookie),
   });
   return res.data;
@@ -346,16 +346,13 @@ async function deleteTorrentFromQBittorrent(hash, sidCookie) {
   });
 }
 
-// Deletes torrents whose seeding_time has reached their per-torrent seedingTimeLimit.
 async function pruneCompletedTorrents(sidCookie) {
-  const torrents = await getQBittorrentTorrents(sidCookie);
+  const torrents = await getQBittorrentTorrents(sidCookie, 'completed');
   let pruned = 0;
 
   for (const t of torrents) {
-    if (t.state !== 'pausedUP') continue;
-
     await deleteTorrentFromQBittorrent(t.hash, sidCookie);
-    log(`Pruned: ${t.name} (state: ${t.state}, seeded ${Math.round(t.seeding_time / 3600)}h)`);
+    log(`Pruned: ${t.name} (seeded ${Math.round(t.seeding_time / 3600)}h)`);
     pruned++;
   }
 
@@ -380,7 +377,7 @@ async function main() {
     const existingTorrents = await getQBittorrentTorrents(sidCookie);
     const trackedIds       = extractTrackedIds(existingTorrents);
 
-    const wouldPrune = existingTorrents.filter(t => t.state === 'pausedUP');
+    const wouldPrune = await getQBittorrentTorrents(sidCookie, 'completed');
 
     if (wouldPrune.length > 0) {
       log(`\nTorrents that would be deleted (${wouldPrune.length}):`);
