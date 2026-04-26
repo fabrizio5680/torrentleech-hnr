@@ -17,7 +17,6 @@ Automated script that monitors the TorrentLeech HNR (Hit and Run) page for the u
 - `index.js` — single-file implementation, all logic lives here
 - `.env` — credentials (never commit)
 - `cookies.json` — TorrentLeech session cookie jar, auto-managed (never commit)
-- `downloaded.json` — state: maps torrent ID → `{ downloadedAt, torrentName, qtHash }` (never commit)
 - `cron.log` — output from scheduled runs (never commit)
 
 ## Environment variables (`.env`)
@@ -36,10 +35,10 @@ Automated script that monitors the TorrentLeech HNR (Hit and Run) page for the u
 ## How it works (per run)
 
 1. Load `cookies.json` → test HNR page → re-login if session expired
-2. Paginate all HNR pages, parse col 1 (torrent ID via `onclick`) + col 5 (seeding time)
-3. **Prune**: entries with seeding > 9 days → `DELETE /api/v2/torrents/delete?deleteFiles=true` → remove from `downloaded.json`
-4. **Skip**: IDs already in `downloaded.json`
-5. **Add**: fetch torrent page → extract download link → stream `.torrent` to temp file → `POST /api/v2/torrents/add` with `forceStart=true` and category → capture qBittorrent hash via before/after list diff → record in `downloaded.json`
+2. **Prune**: delete qBittorrent torrents (category) where `seeding_time >= seeding_time_limit * 60`
+3. Paginate all HNR pages, parse col 1 (torrent ID via `onclick`) + col 5 (seeding time in minutes)
+4. **Skip**: IDs already tracked — detected via `tl-{torrentId}` tag on qBittorrent torrents
+5. **Add**: fetch torrent page → extract download link → stream `.torrent` to temp file → `POST /api/v2/torrents/add` with `forceStart=true`, category, tag `tl-{torrentId}`, and `seedingTimeLimit = (PRUNE_MINS - alreadySeedingMins)`
 
 ## Seeding threshold
 
@@ -69,6 +68,7 @@ node index.js --dry-run  # preview only — no downloads, no uploads, no state c
 
 - Base: `QT_URL/api/v2`
 - Auth: `POST /api/v2/auth/login` → `SID` cookie
-- Add: `POST /api/v2/torrents/add` (multipart, `forceStart=true`)
+- Add: `POST /api/v2/torrents/add` (multipart, `forceStart=true`, `tags=tl-{id}`, `seedingTimeLimit` in minutes)
 - Delete: `POST /api/v2/torrents/delete` (`deleteFiles=true`)
 - Hash captured by diffing `/api/v2/torrents/info?category=...` before and after add
+- `seeding_time` in torrent info = seconds; `seeding_time_limit` in torrent info = minutes; -1/-2 = special (skip)
