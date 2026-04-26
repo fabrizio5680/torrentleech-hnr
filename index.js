@@ -156,15 +156,21 @@ async function getTorrentDownloadUrl(torrentId) {
 
 async function downloadToTempFile(downloadUrl) {
   const tmpFile = path.join(os.tmpdir(), `tl-${Date.now()}.torrent`);
-  const res = await client.get(downloadUrl, { responseType: 'stream' });
+  const res = await client.get(downloadUrl, { responseType: 'arraybuffer' });
 
-  await new Promise((resolve, reject) => {
-    const writer = fs.createWriteStream(tmpFile);
-    res.data.pipe(writer);
-    writer.on('finish', resolve);
-    writer.on('error', reject);
-  });
+  const contentType = res.headers['content-type'] || '';
+  const buf = Buffer.from(res.data);
 
+  if (buf.length === 0) {
+    throw new Error(`Downloaded file is empty (content-type: ${contentType})`);
+  }
+  // bencoded torrent files always start with 'd'
+  if (buf[0] !== 0x64) {
+    const preview = buf.slice(0, 120).toString('utf8').replace(/\n/g, ' ');
+    throw new Error(`Downloaded file is not a valid torrent (content-type: ${contentType}, starts with: ${preview})`);
+  }
+
+  fs.writeFileSync(tmpFile, buf);
   return tmpFile;
 }
 
@@ -225,7 +231,6 @@ async function addTorrentToQBittorrent(tmpFile, filename, torrentId, seedingTime
   });
   form.append('category', process.env.QT_CATEGORY);
   form.append('forceStart', 'true');
-  form.append('seedingTimeLimit', String(Math.max(1, Math.round(seedingTimeLimitMins))));
   form.append('tags', `${TL_TAG_PREFIX}${torrentId}`);
 
   const before = new Set((await getQBittorrentTorrents(sidCookie)).map(t => t.hash));
@@ -241,7 +246,26 @@ async function addTorrentToQBittorrent(tmpFile, filename, torrentId, seedingTime
   await sleep(1500);
   const after = await getQBittorrentTorrents(sidCookie);
   const newHash = after.map(t => t.hash).find(h => !before.has(h)) || null;
+
+  if (newHash) {
+    await setTorrentSeedingLimit(newHash, seedingTimeLimitMins, sidCookie);
+  }
+
   return newHash;
+}
+
+async function setTorrentSeedingLimit(hash, seedingTimeLimitMins, sidCookie) {
+  const params = new URLSearchParams();
+  params.append('hashes', hash);
+  params.append('seedingTimeLimit', String(Math.max(1, Math.round(seedingTimeLimitMins))));
+  params.append('ratioLimit', '-2');
+
+  await axios.post(`${QT_BASE}/api/v2/torrents/setShareLimits`, params.toString(), {
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      ...qtHeaders(sidCookie),
+    },
+  });
 }
 
 async function deleteTorrentFromQBittorrent(hash, sidCookie) {
