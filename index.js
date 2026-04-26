@@ -85,7 +85,7 @@ function extractInfoHash(buf) {
 
 // --- TorrentLeech auth ---
 async function login() {
-  log('Logging in to TorrentLeech...');
+  log('[AUTH] Logging in to TorrentLeech...');
   const form = new FormData();
   form.append('username', process.env.USERNAME);
   form.append('password', process.env.PASSWORD);
@@ -99,7 +99,7 @@ async function login() {
   }
 
   saveCookies();
-  log('TorrentLeech login successful');
+  log('[AUTH] TorrentLeech login successful');
 }
 
 function isLoginPage(html) {
@@ -146,9 +146,10 @@ function parseHnrTable(html) {
 async function getAllHnrEntries() {
   const allEntries = [];
   let url = TL_HNR_URL;
+  let page = 1;
 
   while (url) {
-    log(`Fetching HNR page: ${url}`);
+    log(`[HNR] Fetching page ${page}: ${url}`);
     const res = await client.get(url);
 
     if (isLoginPage(res.data)) {
@@ -158,9 +159,10 @@ async function getAllHnrEntries() {
 
     const { entries, nextPage } = parseHnrTable(res.data);
     allEntries.push(...entries);
-    log(`  Found ${entries.length} entries on this page`);
+    log(`[HNR] Page ${page}: ${entries.length} entries`);
 
     url = nextPage;
+    page++;
     if (nextPage) await sleep(1500);
   }
 
@@ -222,13 +224,13 @@ async function loginQBittorrent() {
   if (!sidEntry) throw new Error('qBittorrent login failed — no SID cookie in response');
 
   const sid = sidEntry.split(';')[0];
-  log('qBittorrent login successful');
+  log('[QBT] Login successful');
   return sid;
 }
 
-async function getQBittorrentTorrents(sidCookie, filter) {
+async function getQBittorrentTorrents(sidCookie) {
   const res = await axios.get(`${QT_BASE}/api/v2/torrents/info`, {
-    params: { category: QT_CATEGORY, ...(filter && { filter }) },
+    params: { category: QT_CATEGORY },
     headers: qtHeaders(sidCookie),
   });
   return res.data;
@@ -284,14 +286,13 @@ async function addTorrentToQBittorrent(tmpFile, filename, torrentId, seedingTime
     const infoHash = extractInfoHash(fs.readFileSync(tmpFile));
     const existing = (await getAllQBittorrentTorrents(sidCookie)).find(t => t.hash === infoHash);
     if (existing) {
-      // Subtract already-elapsed seeding time so the limit is relative to qBT's counter
       const alreadySeedingMins = Math.floor(existing.seeding_time / 60);
       const adjustedLimitMins  = alreadySeedingMins + seedingTimeLimitMins;
-      log(`  Duplicate detected (hash ${infoHash.slice(0, 8)}…) — tagging, qBT already seeded ${alreadySeedingMins}m, adjusted limit: ${adjustedLimitMins}m (${Math.round(adjustedLimitMins/60)}h)`);
+      log(`[ADD] Duplicate hash ${infoHash.slice(0, 8)}… — tagging existing, qBT seeded ${alreadySeedingMins}m, adjusted limit: ${adjustedLimitMins}m (${Math.round(adjustedLimitMins / 60)}h)`);
       await addTagToTorrent(existing.hash, `${TL_TAG_PREFIX}${torrentId}`, sidCookie);
       await setTorrentSeedingLimit(existing.hash, adjustedLimitMins, sidCookie);
       await resumeTorrent(existing.hash, sidCookie);
-      return existing.hash;
+      return { hash: existing.hash, duplicate: true };
     }
     throw new Error(`qBittorrent rejected torrent: "Fails." (no matching hash found)`);
   }
@@ -308,7 +309,7 @@ async function addTorrentToQBittorrent(tmpFile, filename, torrentId, seedingTime
     await setTorrentSeedingLimit(newHash, seedingTimeLimitMins, sidCookie);
   }
 
-  return newHash;
+  return { hash: newHash, duplicate: false };
 }
 
 async function setTorrentSeedingLimit(hash, seedingTimeLimitMins, sidCookie) {
@@ -346,17 +347,29 @@ async function deleteTorrentFromQBittorrent(hash, sidCookie) {
   });
 }
 
-async function pruneCompletedTorrents(sidCookie) {
-  const torrents = await getQBittorrentTorrents(sidCookie, 'completed');
-  let pruned = 0;
+// Deletes torrents in QT_CATEGORY where state is 'pausedUP' (seeding time limit reached, auto-paused by qBittorrent)
+async function pruneCompletedTorrents(sidCookie, dryRun = false) {
+  const torrents = await getQBittorrentTorrents(sidCookie);
+  const toDelete = torrents.filter(t => t.state === 'pausedUP');
 
-  for (const t of torrents) {
-    await deleteTorrentFromQBittorrent(t.hash, sidCookie);
-    log(`Pruned: ${t.name} (seeded ${Math.round(t.seeding_time / 3600)}h)`);
-    pruned++;
+  log(`[PRUNE] Category "${QT_CATEGORY}": ${torrents.length} total, ${toDelete.length} completed (pausedUP)`);
+
+  let pruned = 0;
+  for (const t of toDelete) {
+    const seededH   = (t.seeding_time / 3600).toFixed(1);
+    const limitMins = t.seeding_time_limit;
+    const limitStr  = limitMins > 0 ? `limit ${Math.round(limitMins / 60)}h` : 'global limit';
+    if (dryRun) {
+      log(`[PRUNE] Would delete: "${t.name}" (seeded ${seededH}h, ${limitStr}, state: ${t.state})`);
+    } else {
+      await deleteTorrentFromQBittorrent(t.hash, sidCookie);
+      log(`[PRUNE] Deleted: "${t.name}" (seeded ${seededH}h, ${limitStr})`);
+      pruned++;
+    }
   }
 
-  log(`Pruned ${pruned} completed torrent(s)`);
+  if (toDelete.length === 0) log('[PRUNE] Nothing to prune');
+  return { categoryTotal: torrents.length, pruned: dryRun ? 0 : pruned, wouldPrune: toDelete.length };
 }
 
 // --- Utilities ---
@@ -367,80 +380,76 @@ function sleep(ms) {
 // --- Main ---
 async function main() {
   const dryRun = process.argv.includes('--dry-run');
-  if (dryRun) log('=== DRY RUN — no files will be downloaded or uploaded ===');
-  log('=== TorrentLeech HNR runner starting ===');
+  log(`=== TorrentLeech HNR runner starting${dryRun ? ' [DRY RUN]' : ''} ===`);
+
+  const stats = {
+    pruned:       0,
+    hnrTotal:     0,
+    hnrSkipped:   0,
+    hnrAttempted: 0,
+    hnrAdded:     0,
+    hnrDuplicate: 0,
+    hnrFailed:    0,
+  };
 
   await ensureLoggedIn();
   const sidCookie = await loginQBittorrent();
 
-  if (dryRun) {
-    const existingTorrents = await getQBittorrentTorrents(sidCookie);
-    const trackedIds       = extractTrackedIds(existingTorrents);
+  // Step 1: Prune completed torrents
+  const pruneResult = await pruneCompletedTorrents(sidCookie, dryRun);
+  stats.pruned = pruneResult.pruned;
 
-    const wouldPrune = await getQBittorrentTorrents(sidCookie, 'completed');
-
-    if (wouldPrune.length > 0) {
-      log(`\nTorrents that would be deleted (${wouldPrune.length}):`);
-      for (const t of wouldPrune) {
-        log(`  ${t.name} (seeded: ${Math.round(t.seeding_time / 3600)}h)`);
-      }
-    }
-
-    const entries    = await getAllHnrEntries();
-    const toDownload = entries.filter(({ torrentId }) => !trackedIds.has(torrentId));
-
-    if (toDownload.length > 0) {
-      log(`\nFiles that would be uploaded to qBittorrent (${toDownload.length}):`);
-      for (const { torrentId, seedingText, seedingMins } of toDownload) {
-        const remainingMins = Math.max(1, PRUNE_MINS - seedingMins);
-        const downloadUrl   = await getTorrentDownloadUrl(torrentId);
-        const filename      = path.basename(new URL(downloadUrl).pathname);
-        log(`  [${torrentId}] ${filename}  (seeded: ${seedingText}, remaining limit: ${Math.round(remainingMins / 60)}h)`);
-        await sleep(500);
-      }
-    }
-
-    if (wouldPrune.length === 0 && toDownload.length === 0) log('Nothing to do.');
-    log('\nDry run complete — nothing written.');
-    return;
-  }
-
-  await pruneCompletedTorrents(sidCookie);
-
-  // Fetch fresh list after prune to build skip set
+  // Step 2: Build skip-set from current category torrents (after prune)
   const activeTorrents = await getQBittorrentTorrents(sidCookie);
   const trackedIds     = extractTrackedIds(activeTorrents);
-  log(`qBittorrent tracking ${trackedIds.size} TL torrent(s)`);
+  log(`[TRACK] qBittorrent tracking ${trackedIds.size} TL torrent ID(s) in category`);
 
-  const entries    = await getAllHnrEntries();
-  log(`Total HNR entries found: ${entries.length}`);
+  // Step 3: Fetch all HNR entries
+  const entries = await getAllHnrEntries();
+  stats.hnrTotal = entries.length;
+  log(`[HNR] Total entries: ${entries.length}`);
 
   const toDownload = entries.filter(({ torrentId }) => !trackedIds.has(torrentId));
-  log(`New torrents to download: ${toDownload.length}`);
+  stats.hnrSkipped = entries.length - toDownload.length;
+  log(`[HNR] Already tracked: ${stats.hnrSkipped}, new to add: ${toDownload.length}`);
 
-  if (toDownload.length === 0) {
-    log('Nothing to do.');
-    return;
+  if (toDownload.length === 0 && !dryRun) {
+    log('[HNR] Nothing to add');
   }
 
-  for (const { torrentId, seedingMins } of toDownload) {
+  // Step 4: Add new torrents
+  for (const { torrentId, seedingMins, seedingText } of toDownload) {
+    const remainingMins = Math.max(1, PRUNE_MINS - seedingMins);
     let tmpFile;
     try {
-      log(`Processing torrent ID ${torrentId}...`);
+      log(`[ADD] Torrent ${torrentId} — TL seeded: ${seedingText} (${seedingMins}m), limit to set: ${Math.round(remainingMins / 60)}h (${remainingMins}m)`);
 
-      const downloadUrl   = await getTorrentDownloadUrl(torrentId);
-      const filename      = path.basename(new URL(downloadUrl).pathname);
-      const remainingMins = Math.max(1, PRUNE_MINS - seedingMins);
+      const downloadUrl = await getTorrentDownloadUrl(torrentId);
+      const filename    = path.basename(new URL(downloadUrl).pathname);
+
+      if (dryRun) {
+        log(`[ADD] Would add: ${filename}`);
+        stats.hnrAttempted++;
+        continue;
+      }
 
       tmpFile = await downloadToTempFile(downloadUrl);
-      log(`  Downloaded to temp: ${tmpFile}`);
 
-      const qtHash = await addTorrentToQBittorrent(tmpFile, filename, torrentId, remainingMins, sidCookie);
-      log(`  Added to qBittorrent: ${filename} [limit: ${Math.round(remainingMins / 60)}h]${qtHash ? ` [hash: ${qtHash}]` : ' [hash not captured]'}`);
+      stats.hnrAttempted++;
+      const { hash, duplicate } = await addTorrentToQBittorrent(tmpFile, filename, torrentId, remainingMins, sidCookie);
+
+      if (duplicate) {
+        stats.hnrDuplicate++;
+        log(`[ADD] Tagged duplicate: ${filename}${hash ? ` [${hash.slice(0, 8)}…]` : ''}`);
+      } else {
+        stats.hnrAdded++;
+        log(`[ADD] Added: ${filename}${hash ? ` [${hash.slice(0, 8)}…]` : ' [hash not captured]'}`);
+      }
 
       await sleep(2000);
     } catch (e) {
-      err(`Failed on torrent ${torrentId}:`, e.message);
+      stats.hnrFailed++;
+      err(`[ADD] Failed torrent ${torrentId}: ${e.message}`);
       process.exitCode = 1;
     } finally {
       if (tmpFile && fs.existsSync(tmpFile)) {
@@ -449,7 +458,15 @@ async function main() {
     }
   }
 
-  log('=== Done ===');
+  // Step 5: Summary
+  log('=== Run complete ===');
+  log(`[STATS] Pruned:     ${stats.pruned}${dryRun ? ` (would prune: ${pruneResult.wouldPrune})` : ''}`);
+  log(`[STATS] HNR total:  ${stats.hnrTotal}`);
+  log(`[STATS] Skipped:    ${stats.hnrSkipped} (already tracked)`);
+  log(`[STATS] Attempted:  ${stats.hnrAttempted}`);
+  log(`[STATS] Added:      ${stats.hnrAdded}`);
+  log(`[STATS] Duplicates: ${stats.hnrDuplicate} (existing tagged)`);
+  log(`[STATS] Failed:     ${stats.hnrFailed}`);
 }
 
 main().catch(e => {
