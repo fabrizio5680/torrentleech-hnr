@@ -347,17 +347,15 @@ async function deleteTorrentFromQBittorrent(hash, sidCookie) {
 }
 
 // Deletes torrents whose seeding_time has reached their per-torrent seedingTimeLimit.
-// seeding_time (qBT info) = seconds; seeding_time_limit (qBT info) = minutes; -1/-2 = special values, skip.
 async function pruneCompletedTorrents(sidCookie) {
   const torrents = await getQBittorrentTorrents(sidCookie);
   let pruned = 0;
 
   for (const t of torrents) {
-    const limitMins = t.seeding_time_limit > 0 ? t.seeding_time_limit : PRUNE_MINS;
-    if (t.seeding_time < limitMins * 60) continue;
+    if (t.state !== 'pausedUP') continue;
 
     await deleteTorrentFromQBittorrent(t.hash, sidCookie);
-    log(`Pruned: ${t.name} (seeded ${Math.round(t.seeding_time / 3600)}h / limit ${limitMins}m)`);
+    log(`Pruned: ${t.name} (state: ${t.state}, seeded ${Math.round(t.seeding_time / 3600)}h)`);
     pruned++;
   }
 
@@ -382,10 +380,7 @@ async function main() {
     const existingTorrents = await getQBittorrentTorrents(sidCookie);
     const trackedIds       = extractTrackedIds(existingTorrents);
 
-    const wouldPrune = existingTorrents.filter(t => {
-      const limitMins = t.seeding_time_limit > 0 ? t.seeding_time_limit : PRUNE_MINS;
-      return t.seeding_time >= limitMins * 60;
-    });
+    const wouldPrune = existingTorrents.filter(t => t.state === 'pausedUP');
 
     if (wouldPrune.length > 0) {
       log(`\nTorrents that would be deleted (${wouldPrune.length}):`);
