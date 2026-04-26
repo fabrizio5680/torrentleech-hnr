@@ -21,6 +21,7 @@ const COOKIES_FILE  = path.join(__dirname, 'cookies.json');
 const PRUNE_DAYS    = 9;
 const PRUNE_MINS    = PRUNE_DAYS * 24 * 60;
 const TL_TAG_PREFIX = 'tl-';
+const QT_CATEGORY   = 'TorrentLeech-HNR';
 const USER_AGENT    = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 // --- Cookie jar (loaded from disk if available) ---
@@ -227,7 +228,7 @@ async function loginQBittorrent() {
 
 async function getQBittorrentTorrents(sidCookie) {
   const res = await axios.get(`${QT_BASE}/api/v2/torrents/info`, {
-    params: { category: process.env.QT_CATEGORY },
+    params: { category: QT_CATEGORY },
     headers: qtHeaders(sidCookie),
   });
   return res.data;
@@ -268,7 +269,7 @@ async function addTorrentToQBittorrent(tmpFile, filename, torrentId, seedingTime
     filename,
     contentType: 'application/x-bittorrent',
   });
-  form.append('category', process.env.QT_CATEGORY);
+  form.append('category', QT_CATEGORY);
   form.append('forceStart', 'true');
   form.append('tags', `${TL_TAG_PREFIX}${torrentId}`);
 
@@ -352,11 +353,11 @@ async function pruneCompletedTorrents(sidCookie) {
   let pruned = 0;
 
   for (const t of torrents) {
-    if (t.seeding_time_limit <= 0) continue;
-    if (t.seeding_time < t.seeding_time_limit * 60) continue;
+    const limitMins = t.seeding_time_limit > 0 ? t.seeding_time_limit : PRUNE_MINS;
+    if (t.seeding_time < limitMins * 60) continue;
 
     await deleteTorrentFromQBittorrent(t.hash, sidCookie);
-    log(`Pruned: ${t.name} (seeded ${Math.round(t.seeding_time / 3600)}h / limit ${t.seeding_time_limit}m)`);
+    log(`Pruned: ${t.name} (seeded ${Math.round(t.seeding_time / 3600)}h / limit ${limitMins}m)`);
     pruned++;
   }
 
@@ -381,9 +382,10 @@ async function main() {
     const existingTorrents = await getQBittorrentTorrents(sidCookie);
     const trackedIds       = extractTrackedIds(existingTorrents);
 
-    const wouldPrune = existingTorrents.filter(
-      t => t.seeding_time_limit > 0 && t.seeding_time >= t.seeding_time_limit * 60
-    );
+    const wouldPrune = existingTorrents.filter(t => {
+      const limitMins = t.seeding_time_limit > 0 ? t.seeding_time_limit : PRUNE_MINS;
+      return t.seeding_time >= limitMins * 60;
+    });
 
     if (wouldPrune.length > 0) {
       log(`\nTorrents that would be deleted (${wouldPrune.length}):`);
