@@ -7,6 +7,7 @@ import FormData from 'form-data';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -57,6 +58,28 @@ function parseSeedingMins(text) {
   if (h) mins += parseInt(h[1], 10) * 60;
   if (m) mins += parseInt(m[1], 10);
   return mins;
+}
+
+// Extracts the info hash (SHA1 of bencoded info dict) from a .torrent buffer
+function extractInfoHash(buf) {
+  const marker = Buffer.from('4:info');
+  const idx = buf.indexOf(marker);
+  if (idx === -1) throw new Error('No info dict in torrent');
+  let pos = idx + marker.length;
+  if (buf[pos] !== 0x64) throw new Error('Info value is not a dict');
+  let depth = 0;
+  const start = pos;
+  while (pos < buf.length) {
+    const c = buf[pos];
+    if (c === 0x64 || c === 0x6c) { depth++; pos++; }
+    else if (c === 0x65) { depth--; pos++; if (depth === 0) break; }
+    else if (c >= 0x30 && c <= 0x39) {
+      let e = pos; while (buf[e] !== 0x3a) e++;
+      pos = e + 1 + parseInt(buf.slice(pos, e).toString(), 10);
+    } else if (c === 0x69) { pos++; while (buf[pos] !== 0x65) pos++; pos++; }
+    else throw new Error(`Unexpected bencode byte 0x${c.toString(16)} at ${pos}`);
+  }
+  return crypto.createHash('sha1').update(buf.slice(start, pos)).digest('hex');
 }
 
 // --- TorrentLeech auth ---
@@ -210,6 +233,22 @@ async function getQBittorrentTorrents(sidCookie) {
   return res.data;
 }
 
+async function getAllQBittorrentTorrents(sidCookie) {
+  const res = await axios.get(`${QT_BASE}/api/v2/torrents/info`, {
+    headers: qtHeaders(sidCookie),
+  });
+  return res.data;
+}
+
+async function addTagToTorrent(hash, tag, sidCookie) {
+  const params = new URLSearchParams();
+  params.append('hashes', hash);
+  params.append('tags', tag);
+  await axios.post(`${QT_BASE}/api/v2/torrents/addTags`, params.toString(), {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...qtHeaders(sidCookie) },
+  });
+}
+
 // Returns Set of TL torrent IDs already tracked via tags in qBittorrent
 function extractTrackedIds(torrents) {
   return new Set(
@@ -238,6 +277,23 @@ async function addTorrentToQBittorrent(tmpFile, filename, torrentId, seedingTime
   const res = await axios.post(`${QT_BASE}/api/v2/torrents/add`, form, {
     headers: { ...form.getHeaders(), ...qtHeaders(sidCookie) },
   });
+
+  if (res.data === 'Fails.') {
+    // Duplicate — find the existing torrent by info hash and tag it
+    const infoHash = extractInfoHash(fs.readFileSync(tmpFile));
+    const existing = (await getAllQBittorrentTorrents(sidCookie)).find(t => t.hash === infoHash);
+    if (existing) {
+      // Subtract already-elapsed seeding time so the limit is relative to qBT's counter
+      const alreadySeedingMins = Math.floor(existing.seeding_time / 60);
+      const adjustedLimitMins  = alreadySeedingMins + seedingTimeLimitMins;
+      log(`  Duplicate detected (hash ${infoHash.slice(0, 8)}…) — tagging, qBT already seeded ${alreadySeedingMins}m, adjusted limit: ${adjustedLimitMins}m (${Math.round(adjustedLimitMins/60)}h)`);
+      await addTagToTorrent(existing.hash, `${TL_TAG_PREFIX}${torrentId}`, sidCookie);
+      await setTorrentSeedingLimit(existing.hash, adjustedLimitMins, sidCookie);
+      await resumeTorrent(existing.hash, sidCookie);
+      return existing.hash;
+    }
+    throw new Error(`qBittorrent rejected torrent: "Fails." (no matching hash found)`);
+  }
 
   if (res.data !== 'Ok.') {
     throw new Error(`qBittorrent rejected torrent: "${res.data}"`);
@@ -268,6 +324,14 @@ async function setTorrentSeedingLimit(hash, seedingTimeLimitMins, sidCookie) {
   });
 }
 
+async function resumeTorrent(hash, sidCookie) {
+  const params = new URLSearchParams();
+  params.append('hashes', hash);
+  await axios.post(`${QT_BASE}/api/v2/torrents/resume`, params.toString(), {
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...qtHeaders(sidCookie) },
+  });
+}
+
 async function deleteTorrentFromQBittorrent(hash, sidCookie) {
   const params = new URLSearchParams();
   params.append('hashes', hash);
@@ -292,7 +356,7 @@ async function pruneCompletedTorrents(sidCookie) {
     if (t.seeding_time < t.seeding_time_limit * 60) continue;
 
     await deleteTorrentFromQBittorrent(t.hash, sidCookie);
-    log(`Pruned: ${t.name} (seeded ${Math.round(t.seeding_time / 3600)}h / limit ${Math.round(t.seeding_time_limit / 60)}h)`);
+    log(`Pruned: ${t.name} (seeded ${Math.round(t.seeding_time / 3600)}h / limit ${t.seeding_time_limit}m)`);
     pruned++;
   }
 

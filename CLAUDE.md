@@ -66,6 +66,8 @@ node index.js --dry-run  # preview only — no downloads, no uploads, no state c
 
 ## qBittorrent API notes
 
+- Version: **4.3.9**
+- API docs: [WebUI API (qBittorrent 4.1)](https://github.com/qbittorrent/qBittorrent/wiki/WebUI-API-(qBittorrent-4.1))
 - Base: `QT_URL/api/v2`
 - Auth: `POST /api/v2/auth/login` → `SID` cookie
 - Add: `POST /api/v2/torrents/add` (multipart, `forceStart=true`, `tags=tl-{id}`, `seedingTimeLimit` in minutes)
