@@ -22,6 +22,7 @@ const PRUNE_DAYS    = 9;
 const PRUNE_MINS    = PRUNE_DAYS * 24 * 60;
 const TL_TAG_PREFIX = 'tl-';
 const QT_CATEGORY   = 'TorrentLeech-HNR';
+const EXTRA_PRUNE_CATEGORIES = ['tv-sonarr', 'radarr'];
 const USER_AGENT    = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 // --- Cookie jar (loaded from disk if available) ---
@@ -228,9 +229,9 @@ async function loginQBittorrent() {
   return sid;
 }
 
-async function getQBittorrentTorrents(sidCookie) {
+async function getQBittorrentTorrents(sidCookie, category = QT_CATEGORY) {
   const res = await axios.get(`${QT_BASE}/api/v2/torrents/info`, {
-    params: { category: QT_CATEGORY },
+    params: { category },
     headers: qtHeaders(sidCookie),
   });
   return res.data;
@@ -347,12 +348,12 @@ async function deleteTorrentFromQBittorrent(hash, sidCookie) {
   });
 }
 
-// Deletes torrents in QT_CATEGORY where state is 'pausedUP' (seeding time limit reached, auto-paused by qBittorrent)
-async function pruneCompletedTorrents(sidCookie, dryRun = false) {
-  const torrents = await getQBittorrentTorrents(sidCookie);
+// Deletes torrents in given category where state is 'pausedUP' (seeding time limit reached, auto-paused by qBittorrent)
+async function pruneCompletedTorrents(sidCookie, category = QT_CATEGORY, dryRun = false) {
+  const torrents = await getQBittorrentTorrents(sidCookie, category);
   const toDelete = torrents.filter(t => t.state === 'pausedUP');
 
-  log(`[PRUNE] Category "${QT_CATEGORY}": ${torrents.length} total, ${toDelete.length} completed (pausedUP)`);
+  log(`[PRUNE] Category "${category}": ${torrents.length} total, ${toDelete.length} completed (pausedUP)`);
 
   let pruned = 0;
   for (const t of toDelete) {
@@ -395,9 +396,12 @@ async function main() {
   await ensureLoggedIn();
   const sidCookie = await loginQBittorrent();
 
-  // Step 1: Prune completed torrents
-  const pruneResult = await pruneCompletedTorrents(sidCookie, dryRun);
-  stats.pruned = pruneResult.pruned;
+  // Step 1: Prune completed torrents across all managed categories
+  for (const cat of [QT_CATEGORY, ...EXTRA_PRUNE_CATEGORIES]) {
+    const pruneResult = await pruneCompletedTorrents(sidCookie, cat, dryRun);
+    stats.pruned += pruneResult.pruned;
+    if (dryRun) stats._wouldPrune = (stats._wouldPrune || 0) + pruneResult.wouldPrune;
+  }
 
   // Step 2: Build skip-set from current category torrents (after prune)
   const activeTorrents = await getQBittorrentTorrents(sidCookie);
@@ -460,7 +464,7 @@ async function main() {
 
   // Step 5: Summary
   log('=== Run complete ===');
-  log(`[STATS] Pruned:     ${stats.pruned}${dryRun ? ` (would prune: ${pruneResult.wouldPrune})` : ''}`);
+  log(`[STATS] Pruned:     ${stats.pruned}${dryRun ? ` (would prune: ${stats._wouldPrune || 0})` : ''}`);
   log(`[STATS] HNR total:  ${stats.hnrTotal}`);
   log(`[STATS] Skipped:    ${stats.hnrSkipped} (already tracked)`);
   log(`[STATS] Attempted:  ${stats.hnrAttempted}`);
